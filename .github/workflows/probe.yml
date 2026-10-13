@@ -1,0 +1,93 @@
+# Scheduled HTTP checks. The target base URL and the page marker live in repository secrets, never in this file.
+# - Four read-only checks: page, map API (+ database), object storage, search (+ model service). Any failure fails the check step.
+# - Retries: 2 retries 15 s apart, 15 s per attempt, 60 s total retry window; transport errors are always retried,
+#   HTTP is retried only on 408 / 429 / 500 / 502 / 503 / 504.
+# - One email per hour at most: when this run fails and the previous failed run started less than 60 minutes ago,
+#   the run ends green with a warning instead (GitHub emails on failed runs only).
+# - Logs stay generic: the host and the base path are masked, response bodies are never printed.
+# - Keepalive: GitHub disables schedules in public repos after 60 days without activity; when the last commit is
+#   45+ days old, the bot updates .keepalive. The cron line is never touched, so alerts keep going to its author.
+# - Manual runs accept extra_path; a path that does not exist should turn the run red (alert self-test).
+name: probe
+
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      extra_path:
+        description: 'Self-test: also check this path (one that does not exist should turn the run red)'
+        required: false
+        default: ''
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE: ${{ secrets.PROBE_BASE }}
+      PAGE_MARK: ${{ secrets.PROBE_PAGE_MARK }}
+      EXTRA_PATH: ${{ inputs.extra_path }}
+      GH_TOKEN: ${{ github.token }}
+      WORKFLOW_FILE: probe.yml
+    steps:
+      - name: Mask target
+        run: |
+          [ -n "$BASE" ] && [ -n "$PAGE_MARK" ] || { echo "::error::secrets PROBE_BASE / PROBE_PAGE_MARK are not set"; exit 1; }
+          rest="${BASE#*://}"
+          host="${rest%%/*}"
+          echo "::add-mask::$host"
+          if [ "$rest" != "$host" ]; then echo "::add-mask::${rest#*/}"; fi
+
+      - name: Check
+        run: |
+          fails=0
+          req() { rm -f body; curl --no-progress-meter -g --connect-timeout 10 --max-time 15 --retry 2 --retry-delay 15 --retry-all-errors --retry-max-time 60 -o body -w '%{http_code} %{exitcode}' "$@" 2>/dev/null; }
+          ok()  { echo "- ✓ $1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          bad() { echo "- ✗ $1" | tee -a "$GITHUB_STEP_SUMMARY"; fails=$((fails + 1)); }
+
+          read -r code rc <<< "$(req "$BASE/")" || true
+          if [ "$code" = 200 ] && grep -qF -- "$PAGE_MARK" body; then ok "page → 200"; else bad "page → HTTP $code, curl exit $rc"; fi
+
+          read -r code rc <<< "$(req "$BASE/api/map")" || true
+          if [ "$code" = 200 ] && jq -e '.version == "v1" and .item_count > 0' body > /dev/null 2>&1; then ok "map API + database → 200"; else bad "map API + database → HTTP $code, curl exit $rc"; fi
+
+          read -r code rc <<< "$(req "$BASE/media/probe.txt")" || true
+          if [ "$code" = 200 ] && grep -q 'probe ok' body; then ok "object storage → 200"; else bad "object storage → HTTP $code, curl exit $rc"; fi
+
+          read -r code rc <<< "$(req -X POST -H 'content-type: application/json' -H 'x-p1-probe: uptime' -d '{"text":"teapot"}' "$BASE/api/search")" || true
+          if [ "$code" = 200 ] && jq -e '(.results | length) > 0' body > /dev/null 2>&1; then ok "search + model service → 200"; else bad "search + model service → HTTP $code, curl exit $rc"; fi
+
+          if [ -n "$EXTRA_PATH" ]; then
+            read -r code rc <<< "$(req "$BASE$EXTRA_PATH")" || true
+            if [ "$code" = 200 ]; then ok "self-test $EXTRA_PATH → 200"; else bad "self-test $EXTRA_PATH → HTTP $code, curl exit $rc"; fi
+          fi
+
+          [ "$fails" -eq 0 ] && exit 0
+          last=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?status=failure&per_page=1" --jq '.workflow_runs[0].run_started_at // .workflow_runs[0].created_at // empty' 2>/dev/null || true)
+          if [ -n "$last" ] && [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -lt 3600 ]; then
+            msg="still failing; already alerted by the failed run that started at $last (UTC), no new email this time"
+            echo "::warning::$msg"
+            echo "- $msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit 1
+
+      - name: Keepalive
+        if: always()
+        continue-on-error: true
+        run: |
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date')
+          days=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+          if [ "$days" -lt 45 ]; then echo "last commit $days day(s) ago"; exit 0; fi
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/.keepalive" --jq .sha 2>/dev/null || true)
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/.keepalive" -f message=keepalive -f content="$(date -u +%F | base64)" ${sha:+-f sha="$sha"} --silent
+          echo "keepalive commit pushed (last commit was $days days ago)"
